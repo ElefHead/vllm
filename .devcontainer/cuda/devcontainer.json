@@ -27,9 +27,11 @@
         }
     },
     "containerEnv": {
-        "HF_TOKEN": "${localEnv:HF_TOKEN}"
+        "HF_TOKEN": "${localEnv:HF_TOKEN}",
+        "VLLM_USE_PRECOMPILED": "True"
     },
     "mounts": [
         "source=${localEnv:HOME}/.config,target=/root/.config,type=bind,consistency=cached"
-    ]
+    ],
+    "onCreateCommand": "pip install -e ."
 }
