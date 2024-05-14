@@ -5,7 +5,10 @@
         "context": "../..",
         "target": "dev"
     },
-    "runArgs": ["--gpus", "all"],
+    "runArgs": [
+        "--gpus", "all",
+        "-w", "${currentWorkspaceFolder}"
+    ],
     "customizations": {
         "vscode": {
             "extensions": [
