@@ -26,6 +26,7 @@ class Attention(nn.Module):
         num_heads: int,
         head_size: int,
         scale: float,
+        causal: bool = True,
         num_kv_heads: Optional[int] = None,
         alibi_slopes: Optional[List[float]] = None,
         sliding_window: Optional[int] = None,

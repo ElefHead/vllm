@@ -2,10 +2,12 @@
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.40.2/src/transformers/models/mbart/modeling_mbart.py
 # 
-# This code is adapted from The Huggingface Inc. and Facebook AI Research Team's code for
+# This code is adapted from The Huggingface Inc. 
+# and Facebook AI Research Team's code for
 # Pytorch based MBART Model. The original license is attached below.
 #
-# Copyright 2021, The Facebook AI Research Team and The HuggingFace Inc. team. All rights reserved.
+# Copyright 2021, The Facebook AI Research Team and The HuggingFace Inc. team. 
+# All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,36 +24,25 @@
 import math
 import torch
 from torch import nn
-from torch import functional as F
 
 from transformers import MBartConfig
 
+from vllm.config import LoRAConfig
 from vllm.attention import Attention, AttentionMetadata
-from vllm.distributed import (get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
+from vllm.model_executor.layers.sampler import Sampler
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.layers.activation import get_act_fn
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               QKVParallelLinear,
+from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                RowParallelLinear)
+from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.sequence import SamplerOutput
 
-from typing import Optional, List
-
-
-# Copied from transformers.models.llama.modeling_llama._get_unpad_data
-def _get_unpad_data(attention_mask):
-    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
-    return (
-        indices,
-        cu_seqlens,
-        max_seqlen_in_batch,
-    )
+from typing import Optional, List, Iterable, Tuple
 
 
 def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int):
@@ -68,7 +59,9 @@ def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int):
     # replace possible -100 values in labels by `pad_token_id`
     prev_output_tokens.masked_fill_(prev_output_tokens == -100, pad_token_id)
 
-    index_of_eos = (prev_output_tokens.ne(pad_token_id).sum(dim=1) - 1).unsqueeze(-1)
+    index_of_eos = (
+        prev_output_tokens.ne(pad_token_id).sum(dim=1) - 1
+    ).unsqueeze(-1)
     decoder_start_tokens = prev_output_tokens.gather(1, index_of_eos).squeeze()
     prev_output_tokens[:, 1:] = prev_output_tokens[:, :-1].clone()
     prev_output_tokens[:, 0] = decoder_start_tokens
@@ -102,22 +95,6 @@ class MBartLearnedPositionalEmbedding(nn.Embedding):
         ).expand(bsz, -1)
 
         return super().forward(positions + self.offset)
-    
-# Copied from 
-# transformers.models.bart.modeling_bart.BartScaledWordEmbedding
-# with Bart->MBart
-class MBartScaledWordEmbedding(nn.Embedding):
-    """
-    This module overrides nn.Embeddings' 
-    forward by multiplying with embeddings scale.
-    """
-
-    def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: int, embed_scale: Optional[float] = 1.0):
-        super().__init__(num_embeddings, embedding_dim, padding_idx)
-        self.embed_scale = embed_scale
-
-    def forward(self, input_ids: torch.Tensor):
-        return super().forward(input_ids) * self.embed_scale
 
 # Copied from transformers.models.bart.modeling_bart.BartAttention
 # with Bart->MBart
@@ -130,6 +107,7 @@ class MBartAttention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
+        is_decoder: int = False,
         bias: bool = True,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
@@ -239,20 +217,18 @@ class MBartEncoderLayer(nn.Module):
                 kv_cache=kv_cache,
                 attn_metadata=attn_metadata
             )
-            hidden_states = nn.functional.dropout(hidden_states, p=self.dropout)
             hidden_states = residual + hidden_states
 
             residual = hidden_states
 
             hidden_states = self.final_layer_norm(hidden_states)
             hidden_states = self.activation_fn(self.fc1(hidden_states))
-            hidden_states = nn.functional.dropout(hidden_states, p=self.activation_dropout, training=self.training)
             hidden_states = self.fc2(hidden_states)
-            hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
             hidden_states = residual + hidden_states
 
             if hidden_states.dtype == torch.float16 and (
-                torch.isinf(hidden_states).any() or torch.isnan(hidden_states).any()
+                torch.isinf(hidden_states).any() or 
+                torch.isnan(hidden_states).any()
             ):
                 clamp_value = torch.finfo(hidden_states.dtype).max - 1000
                 hidden_states = torch.clamp(
@@ -265,29 +241,36 @@ class MBartEncoderLayer(nn.Module):
 
 
 class MBartEncoder(nn.Module):
-    def __init__(self, config: MBartConfig) -> None:
-
-        self.dropout = config.dropout
-        self.layerdrop = config.encoder_layerdrop
-
+    def __init__(
+            self, 
+            config: MBartConfig,
+            embed_tokens: Optional[VocabParallelEmbedding] = None,
+            ) -> None:
         embed_dim = config.d_model
         self.padding_idx = config.pad_token_id
         self.max_source_positions = config.max_position_embeddings
-        self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
+        self.embed_scale = math.sqrt(embed_dim) \
+            if config.scale_embedding else 1.0
 
-        self.embed_tokens = MBartScaledWordEmbedding(
+        self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
-            embedding_dim=embed_dim,
-            padding_idx=self.padding_idx,
-            embed_scale=self.embed_scale
+            embedding_dim=config.d_model,
+            padding_idx=self.padding_idx
         )
 
+        if self.embed_tokens is not None:
+            self.embed_tokens.weight = embed_tokens.weight
+
         self.embed_positions = MBartLearnedPositionalEmbedding(
-            config.max_position_embeddings,
+            self.max_source_positions,
             embedding_dim=embed_dim
         )
 
-        self.layers = nn.ModuleList([MBartEncoderLayer(config) for _ in range(config.encoder_layers)])
+        self.layers = nn.ModuleList(
+            [
+                MBartEncoderLayer(config) for _ in range(config.encoder_layers)
+            ]
+        )
 
         self.layernorm_embedding = nn.LayerNorm(embed_dim)
         self.layer_norm = nn.LayerNorm(config.d_model)
@@ -300,10 +283,9 @@ class MBartEncoder(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ):
-        hidden_states = self.embed_tokens(input_ids) + \
+        hidden_states = self.embed_tokens(input_ids) * self.embed_scale + \
             self.embed_positions(positions)
         hidden_states = self.layernorm_embedding(hidden_states)
-        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout)
 
         for i, layer in enumerate(self.layers):
             hidden_states = layer(
@@ -321,15 +303,16 @@ class MBartDecoderLayer(nn.Module):
                  quant_config: Optional[QuantizationConfig] = None):
         super().__init__()
         self.embed_dim = config.d_model
+        attention_bias = getattr(config, "attention_bias", False) or getattr(
+            config, "bias", False)
 
         self.self_attn = MBartAttention(
             embed_dim=self.embed_dim,
             num_heads=config.decoder_attention_heads,
-            # dropout=config.attention_dropout,
-            # is_decoder=True,
-            # is_causal=True,
-            # config=config,
-
+            is_decoder=True,
+            is_causal=True,
+            bias=attention_bias,
+            quant_config=quant_config
         )
         self.dropout = config.dropout
         self.activation_fn = get_act_fn(
@@ -339,130 +322,203 @@ class MBartDecoderLayer(nn.Module):
         self.activation_dropout = config.activation_dropout
 
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
-        self.encoder_attn = MBART_ATTENTION_CLASSES[config._attn_implementation](
+        
+        self.encoder_attn = MBartAttention(
             self.embed_dim,
-            config.decoder_attention_heads,
-            dropout=config.attention_dropout,
+            num_heads=config.decoder_attention_heads,
             is_decoder=True,
-            config=config,
+            bias=attention_bias,
+            quant_config=quant_config
         )
         self.encoder_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.fc1 = nn.Linear(self.embed_dim, config.decoder_ffn_dim)
         self.fc2 = nn.Linear(config.decoder_ffn_dim, self.embed_dim)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
+    def forward(
+            self,
+            hidden_states: Optional[torch.Tensor],
+            encoder_hidden_states: Optional[torch.Tensor],
+            kv_cache: torch.Tensor,
+            attn_metadata: AttentionMetadata,
+    ) -> None: 
+        residual = hidden_states
+        hidden_states = self.self_attn_layer_norm(hidden_states)
 
+        # causal attention
+        hidden_states = self.self_attn(
+
+        )
+        hidden_states = residual + hidden_states
+
+        # cross attention
+        residual = hidden_states
+        hidden_states = self.encoder_attn_layer_norm(hidden_states)
+
+        hidden_states = self.encoder_attn(
+
+        )
+        hidden_states = residual + hidden_states
+
+        # fully connected
+        residual = hidden_states
+        hidden_states = self.final_layer_norm(hidden_states)
+        hidden_states = self.activation_fn(self.fc1(hidden_states))
+        hidden_states = self.fc2(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
     
 
+class MBartDecoder(nn.Module):
+    def __init__(
+            self,
+            config: MBartConfig,
+            embed_tokens: Optional[VocabParallelEmbedding] = None,
+        ) -> None:
+        self.padding_idx = config.pad_token_id
+        self.max_target_positions = config.max_position_embeddings
+        self.embed_scale = math.sqrt(config.d_model) \
+            if config.scale_embedding else 1.0
+        
+        self.embed_tokens = VocabParallelEmbedding(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.d_model,
+            padding_idx=self.padding_idx
+        )
 
-# class MBartModel(MBartPreTrainedModel):
-#     _tied_weights_keys = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight"]
+        if self.embed_tokens is not None:
+            self.embed_tokens.weight = embed_tokens.weight
 
-#     def __init__(self, config: MBartConfig):
-#         super().__init__(config)
+        self.embed_positions = MBartLearnedPositionalEmbedding(
+            config.max_position_embeddings,
+            config.d_model,
+        )
 
-#         padding_idx, vocab_size = config.pad_token_id, config.vocab_size
-#         self.shared = nn.Embedding(vocab_size, config.d_model, padding_idx)
+        self.layers = nn.ModuleList(
+            [
+                MBartDecoderLayer(config)
+                for _ in range(config.decoder_layers)
+            ]
+        )
+        self.layernorm_embedding = nn.LayerNorm(config.d_model)
+        self.layer_norm = nn.LayerNorm(config.d_model)
 
-#         self.encoder = MBartEncoder(config, self.shared)
-#         self.decoder = MBartDecoder(config, self.shared)
+    def get_input_embeddings(self):
+        return self.embed_tokens
+    
+    def forward(
+            self, 
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            encoder_hidden_state: torch.Tensor,
+            kv_caches: List[torch.Tensor],
+            attn_metadata: AttentionMetadata,
+    ):
+        hidden_state = self.embed_tokens(input_ids) * self.embed_scale + \
+            self.embed_positions(positions)
+        hidden_state = self.layernorm_embedding(hidden_state)
 
-#         # Initialize weights and apply final processing
-#         self.post_init()
+        for i, decoder_layer in enumerate(self.layers):
+            hidden_state = decoder_layer(
 
-#     def get_input_embeddings(self):
-#         return self.shared
+            )
 
-#     def set_input_embeddings(self, value):
-#         self.shared = value
-#         self.encoder.embed_tokens = self.shared
-#         self.decoder.embed_tokens = self.shared
+        hidden_state = self.layer_norm(hidden_state)
+        return hidden_state
 
-#     def get_encoder(self):
-#         return self.encoder
 
-#     def get_decoder(self):
-#         return self.decoder
+class MBartModel(nn.Module):
+    def __init__(
+            self,
+            config: MBartConfig,
+            quant_config: Optional[QuantizationConfig] = None
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.shared = VocabParallelEmbedding(
+            num_embeddings=self.vocab_size,
+            embedding_dim=config.d_model,
+            padding_idx=self.padding_idx,
+        )
 
-#     def _tie_weights(self):
-#         if self.config.tie_word_embeddings:
-#             self._tie_or_clone_weights(self.encoder.embed_tokens, self.get_input_embeddings())
-#             self._tie_or_clone_weights(self.decoder.embed_tokens, self.get_input_embeddings())
+        self.encoder = MBartEncoder(config=config, embed_tokens=self.shared)
+        self.decoder = MBartDecoder(config=config, embed_tokens=self.shared)
 
-#     def forward(
-#         self,
-#         input_ids: torch.LongTensor = None,
-#         attention_mask: Optional[torch.Tensor] = None,
-#         decoder_input_ids: Optional[torch.LongTensor] = None,
-#         decoder_attention_mask: Optional[torch.LongTensor] = None,
-#         head_mask: Optional[torch.Tensor] = None,
-#         decoder_head_mask: Optional[torch.Tensor] = None,
-#         cross_attn_head_mask: Optional[torch.Tensor] = None,
-#         encoder_outputs: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-#         past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-#         inputs_embeds: Optional[torch.FloatTensor] = None,
-#         decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
-#         use_cache: Optional[bool] = None,
-#         output_attentions: Optional[bool] = None,
-#         output_hidden_states: Optional[bool] = None,
-#         return_dict: Optional[bool] = None,
-#     ) -> Union[Seq2SeqModelOutput, Tuple[torch.FloatTensor]]:
-#         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-#         output_hidden_states = (
-#             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-#         )
-#         use_cache = use_cache if use_cache is not None else self.config.use_cache
-#         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.shared(input_ids)
+    
+    def get_encoder(self):
+        return self.encoder
 
-#         # different to other models, MBart automatically creates decoder_input_ids from
-#         # input_ids if no decoder_input_ids are provided
-#         if decoder_input_ids is None and decoder_inputs_embeds is None:
-#             decoder_input_ids = shift_tokens_right(input_ids, self.config.pad_token_id)
+    def get_decoder(self):
+        return self.decoder
+    
+    def forward(
+            self,
+            input_ids: Optional[torch.Tensor],
+            positions: torch.Tensor,
+            kv_caches: List[torch.Tensor],
+            attn_metadata: AttentionMetadata
+    ) -> torch.Tensor:
+        pass
 
-#         if encoder_outputs is None:
-#             encoder_outputs = self.encoder(
-#                 input_ids=input_ids,
-#                 attention_mask=attention_mask,
-#                 head_mask=head_mask,
-#                 inputs_embeds=inputs_embeds,
-#                 output_attentions=output_attentions,
-#                 output_hidden_states=output_hidden_states,
-#                 return_dict=return_dict,
-#             )
-#         # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
-#         elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
-#             encoder_outputs = BaseModelOutput(
-#                 last_hidden_state=encoder_outputs[0],
-#                 hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
-#                 attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
-#             )
 
-#         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
-#         decoder_outputs = self.decoder(
-#             input_ids=decoder_input_ids,
-#             attention_mask=decoder_attention_mask,
-#             encoder_hidden_states=encoder_outputs[0],
-#             encoder_attention_mask=attention_mask,
-#             head_mask=decoder_head_mask,
-#             cross_attn_head_mask=cross_attn_head_mask,
-#             past_key_values=past_key_values,
-#             inputs_embeds=decoder_inputs_embeds,
-#             use_cache=use_cache,
-#             output_attentions=output_attentions,
-#             output_hidden_states=output_hidden_states,
-#             return_dict=return_dict,
-#         )
+class MBartForConditionalGeneration(nn.Module):
+    def __init__(
+            self, 
+            config: MBartConfig,
+            quant_config: Optional[QuantizationConfig] = None,
+            lora_config: Optional[LoRAConfig] = None,
+        ) -> None:
+        super().__init__()
+        self.config = config
+        self.model = MBartModel(config=config, quant_config=quant_config)
+        self.unpadded_vocab_size = config.vocab_size
+        if lora_config:
+            self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
+        self.lm_head = ParallelLMHead(
+            self.unpadded_vocab_size,
+            config.d_model,
+            org_num_embeddings=config.vocab_size,
+            padding_size=DEFAULT_VOCAB_PADDING_SIZE 
+            if not lora_config else lora_config.lora_vocab_padding_size
+        )
 
-#         if not return_dict:
-#             return decoder_outputs + encoder_outputs
+        # todo: handle tie weights
+        self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
+                                                config.vocab_size)
+        self.sampler = Sampler()
 
-#         return Seq2SeqModelOutput(
-#             last_hidden_state=decoder_outputs.last_hidden_state,
-#             past_key_values=decoder_outputs.past_key_values,
-#             decoder_hidden_states=decoder_outputs.hidden_states,
-#             decoder_attentions=decoder_outputs.attentions,
-#             cross_attentions=decoder_outputs.cross_attentions,
-#             encoder_last_hidden_state=encoder_outputs.last_hidden_state,
-#             encoder_hidden_states=encoder_outputs.hidden_states,
-#             encoder_attentions=encoder_outputs.attentions,
-#         )
+    def forward(
+            self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        hidden_states = self.model(input_ids, positions, kv_caches,
+                                   attn_metadata)
+        return hidden_states
+
+    def compute_logits(self, hidden_states: torch.Tensor,
+                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
+        logits = self.logits_processor(self.lm_head.weight, hidden_states,
+                                       sampling_metadata)
+        return logits
+    
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> Optional[SamplerOutput]:
+        next_tokens = self.sampler(logits, sampling_metadata)
+        return next_tokens
+
+    def load_weights(
+            self, 
+            weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> None:
+        pass

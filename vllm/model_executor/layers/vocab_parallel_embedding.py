@@ -49,6 +49,7 @@ class VocabParallelEmbedding(torch.nn.Module):
     def __init__(self,
                  num_embeddings: int,
                  embedding_dim: int,
+                 padding_idx: Optional[int] = None,
                  params_dtype: Optional[torch.dtype] = None,
                  org_num_embeddings: Optional[int] = None,
                  padding_size: int = DEFAULT_VOCAB_PADDING_SIZE):
@@ -59,6 +60,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.org_vocab_size = org_num_embeddings or num_embeddings
         self.num_embeddings_padded = pad_vocab_size(num_embeddings,
                                                     padding_size)
+        self.padding_idx = padding_idx
         self.embedding_dim = embedding_dim
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -97,7 +99,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             masked_input = input_
             # Get the embeddings.
-        output_parallel = F.embedding(masked_input, self.weight)
+        output_parallel = F.embedding(masked_input, self.weight, 
+                                      padding_idx=self.padding_idx)
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel[input_mask, :] = 0.0

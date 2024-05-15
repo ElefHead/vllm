@@ -214,6 +214,7 @@ class FlashAttentionImpl(AttentionImpl):
         head_size: int,
         scale: float,
         num_kv_heads: int,
+        causal: bool,
         alibi_slopes: Optional[List[float]],
         sliding_window: Optional[int],
         kv_cache_dtype: str,
@@ -221,6 +222,7 @@ class FlashAttentionImpl(AttentionImpl):
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
+        self.causal = causal
         self.num_kv_heads = num_kv_heads
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
@@ -319,7 +321,7 @@ class FlashAttentionImpl(AttentionImpl):
                     max_seqlen_q=prefill_meta.max_prefill_seq_len,
                     max_seqlen_k=prefill_meta.max_prefill_seq_len,
                     softmax_scale=self.scale,
-                    causal=True,
+                    causal=self.causal,
                     window_size=self.sliding_window,
                     alibi_slopes=self.alibi_slopes,
                 )

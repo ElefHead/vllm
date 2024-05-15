@@ -198,6 +198,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         head_size: int,
         scale: float,
         num_kv_heads: int,
+        causal: bool,
         alibi_slopes: Optional[List[float]],
         sliding_window: Optional[int],
         kv_cache_dtype: str,
@@ -205,6 +206,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
+        self.causal = causal
         self.num_kv_heads = num_kv_heads
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
@@ -331,7 +333,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                         prefill_meta.seq_start_loc,
                         prefill_meta.max_prefill_seq_len,
                         prefill_meta.max_prefill_seq_len,
-                        True,
+                        self.causal,
                         self.scale,
                     )
                 elif self.use_naive_attn:
@@ -345,6 +347,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                         value,
                         prefill_meta.seq_lens,
                         self.scale,
+                        causal=self.causal
                     )
                 else:
                     out = self.attn_func(
@@ -356,7 +359,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                         max_seqlen_q=prefill_meta.max_prefill_seq_len,
                         max_seqlen_k=prefill_meta.max_prefill_seq_len,
                         softmax_scale=self.scale,
-                        causal=True,
+                        causal=self.causal,
                     )
 
                 # common code for prefill

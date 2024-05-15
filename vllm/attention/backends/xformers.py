@@ -209,6 +209,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         head_size: int,
         scale: float,
         num_kv_heads: int,
+        causal: bool,
         alibi_slopes: Optional[List[float]],
         sliding_window: Optional[int],
         kv_cache_dtype: str,
@@ -217,6 +218,8 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
+        self.causal = causal
+        self.sliding_window = sliding_window
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
