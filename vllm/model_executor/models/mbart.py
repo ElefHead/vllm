@@ -107,7 +107,8 @@ class MBartAttention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        is_decoder: int = False,
+        decoder: bool = False,
+        causal: bool = True,
         bias: bool = True,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
@@ -118,6 +119,8 @@ class MBartAttention(nn.Module):
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
+        self.decoder = decoder
+        self.causal = causal
         if self.total_num_kv_heads >= tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
@@ -161,6 +164,7 @@ class MBartAttention(nn.Module):
             self.num_heads,
             self.head_dim,
             self.scaling,
+            causal=self.causal,
             num_kv_heads=self.num_kv_heads
         )
 
